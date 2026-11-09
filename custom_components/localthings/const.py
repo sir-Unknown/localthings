@@ -213,6 +213,20 @@ PLAINTEXT_DISCOVERY_TIMEOUT_S = 2.5
 PLAINTEXT_READ_TIMEOUT_S = 1.5
 PLAINTEXT_DISCOVERY_RETRIES = 2
 
+# Unicast CoAP sweep for a plaintext socket on a kernel-assigned port, used when
+# nothing answers on PLAINTEXT_DISCOVERY_PORTS (Samsung HW-Q990B: plaintext
+# ports 35854, 47595; secure 44986, 51605). Linux assigns from 32768-60999.
+# Measured on the soundbar over a routed path: found in 3112 datagrams at
+# 400/s (7.9 s).
+SWEEP_FIRST_PORT = 32768
+SWEEP_LAST_PORT = 60999
+SWEEP_DATAGRAMS_PER_SECOND = 400
+SWEEP_TIMEOUT_S = 90.0
+SWEEP_REPLY_GRACE_S = 1.5
+# A failed sweep is not repeated for this long, so a switched-off device does
+# not cost a sweep on every reconnect attempt.
+SWEEP_RETRY_INTERVAL_S = 300.0
+
 # IoTivity classic's multicast secure socket, bound to INADDR_ANY, so a
 # ClientHello to it draws a first flight on any board in this family (issue
 # #482). It does serve a full session -- measured byte-identical to the

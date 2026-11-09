@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import logging
+import os
 import selectors
 import socket
 import time
@@ -31,6 +32,12 @@ from .const import (
     PLAINTEXT_READ_TIMEOUT_S,
     PREFERRED_PROBE_PORTS,
     PROBE_PORT_RANGE,
+    SWEEP_DATAGRAMS_PER_SECOND,
+    SWEEP_FIRST_PORT,
+    SWEEP_LAST_PORT,
+    SWEEP_REPLY_GRACE_S,
+    SWEEP_RETRY_INTERVAL_S,
+    SWEEP_TIMEOUT_S,
 )
 from .registry.identity import device_types_of
 
@@ -492,22 +499,124 @@ def _discover_advertised_ports(host: str) -> tuple[tuple[int, ...], int | None]:
 
     ports: list[int] = []
     answered: int | None = None
-    for port in PLAINTEXT_DISCOVERY_PORTS:
-        result = discover_ocf_secure_ports(
-            host,
-            discovery_port=port,
-            timeout=PLAINTEXT_DISCOVERY_TIMEOUT_S,
-            retries=PLAINTEXT_DISCOVERY_RETRIES,
-        )
-        if result.response_received and answered is None:
-            answered = port
-        for advertised in result.ports:
-            if advertised not in ports:
-                ports.append(advertised)
-        if ports:
+    candidates = list(PLAINTEXT_DISCOVERY_PORTS)
+    remembered = _SWEPT_PLAINTEXT_PORTS.get(host)
+    if remembered is not None and remembered not in candidates:
+        candidates.insert(0, remembered)
+    swept = False
+    while True:
+        for port in candidates:
+            result = discover_ocf_secure_ports(
+                host,
+                discovery_port=port,
+                timeout=PLAINTEXT_DISCOVERY_TIMEOUT_S,
+                retries=PLAINTEXT_DISCOVERY_RETRIES,
+            )
+            if result.response_received and answered is None:
+                answered = port
+            for advertised in result.ports:
+                if advertised not in ports:
+                    ports.append(advertised)
+            if ports:
+                break
+        if ports or answered is not None or swept:
             break
+        # Nothing answered on any conventional port. Boards whose plaintext
+        # socket is kernel-assigned (Samsung HW-Q990B) are only found by asking
+        # every port.
+        swept = True
+        found = _sweep_plaintext_port(host)
+        if found is None:
+            break
+        _SWEPT_PLAINTEXT_PORTS[host] = found
+        candidates = [found]
     _LOGGER.debug("Plaintext CoAP on %s: answered on %s, advertised %s", host, answered, ports)
     return tuple(ports), answered
+
+
+# Plaintext ports found by `_sweep_plaintext_port`, per host. They survive until
+# the device moves, and a stale entry costs one failed read before a new sweep.
+_SWEPT_PLAINTEXT_PORTS: dict[str, int] = {}
+# When a sweep last came back empty, per host: a switched-off device would
+# otherwise pay a full sweep on every reconnect attempt.
+_SWEEP_FAILED_AT: dict[str, float] = {}
+
+
+def _coap_probe(message_id: int, token: bytes) -> bytes:
+    """A CON `GET /oic/res` with Accept 60, as smartthings_local sends it."""
+    return (
+        bytes([0x40 | len(token), 0x01])
+        + message_id.to_bytes(2, "big")
+        + token
+        + b"\xb3oic\x03res\x61\x3c"
+    )
+
+
+def _is_reply(data: bytes, source: tuple, host: str, token: bytes) -> bool:
+    return source[0] == host and len(data) >= 12 and data[4:12] == token
+
+
+def _sweep_plaintext_port(host: str) -> int | None:
+    """The UDP port at `host` that answers a CoAP request, or None.
+
+    Some boards (the HW-Q990B soundbar) bind their plaintext CoAP socket to a
+    kernel-assigned port and do not listen on 5683. Only a CoAP responder
+    answers a datagram carrying our token, so a reply is proof; silence is not.
+    The kernel's ephemeral range goes first, rate-limited to
+    SWEEP_DATAGRAMS_PER_SECOND so neither the soundbar nor any UDP conntrack on
+    the way is flooded. Gives up after SWEEP_TIMEOUT_S, and a failed sweep is
+    not repeated for SWEEP_RETRY_INTERVAL_S.
+    """
+    now = time.monotonic()
+    failed_at = _SWEEP_FAILED_AT.get(host)
+    if failed_at is not None and now - failed_at < SWEEP_RETRY_INTERVAL_S:
+        return None
+    token = os.urandom(8)
+    ports = [
+        *range(SWEEP_FIRST_PORT, SWEEP_LAST_PORT + 1),
+        *range(1024, SWEEP_FIRST_PORT),
+    ]
+    deadline = now + SWEEP_TIMEOUT_S
+    interval = 1.0 / SWEEP_DATAGRAMS_PER_SECOND
+    found: int | None = None
+    sent = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setblocking(False)
+        next_send = time.monotonic()
+        for port in ports:
+            while found is None:
+                try:
+                    data, source = sock.recvfrom(2048)
+                except OSError:
+                    break
+                if _is_reply(data, source, host, token):
+                    found = source[1]
+            if found is not None or time.monotonic() > deadline:
+                break
+            delay = next_send - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            next_send = max(next_send, time.monotonic() - interval) + interval
+            try:
+                sock.sendto(_coap_probe(sent & 0xFFFF, token), (host, port))
+            except OSError:
+                # Local send buffer full or ICMP error surfaced; the next
+                # datagram retries naturally.
+                continue
+            sent += 1
+        if found is None:
+            # Replies to the last datagrams may still be in flight.
+            sock.settimeout(SWEEP_REPLY_GRACE_S)
+            with contextlib.suppress(OSError):
+                data, source = sock.recvfrom(2048)
+                if _is_reply(data, source, host, token):
+                    found = source[1]
+    if found is None:
+        _SWEEP_FAILED_AT[host] = time.monotonic()
+    else:
+        _SWEEP_FAILED_AT.pop(host, None)
+    _LOGGER.debug("CoAP sweep of %s: %s after %d datagrams", host, found, sent)
+    return found
 
 
 def moved_secure_port(
